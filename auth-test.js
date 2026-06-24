@@ -4,27 +4,28 @@
  * auth-test.js — Database-agnostic Signup & Signin Test Script
  *
  * Usage:
- *   node auth-test.js [options]
+ * node auth-test.js [options]
  *
  * Options:
- *   --url           Base URL of your API         (default: http://localhost:3000)
- *   --signup        Signup endpoint path          (default: /auth/signup)
- *   --signin        Signin endpoint path          (default: /auth/signin)
- *   --email-field   Email key in request body     (default: email)
- *   --pass-field    Password key in request body  (default: password)
- *   --token-field   Token key in signin response  (default: token)
- *   --help          Show this help message
+ * --url          Base URL of your API          (default: http://localhost:3000)
+ * --signup       Signup endpoint path          (default: /auth/signup)
+ * --signin       Signin endpoint path          (default: /auth/signin)
+ * --delete       Delete user endpoint path     (default: omitted, skips cleanup)
+ * --email-field  Email key in request body     (default: email)
+ * --pass-field   Password key in request body  (default: password)
+ * --token-field  Token key in signin response  (default: token)
+ * --help         Show this help message
  *
  * Examples:
- *   node auth-test.js
- *   node auth-test.js --url http://localhost:5000 --signup /api/register --signin /api/login
- *   node auth-test.js --email-field username --pass-field pwd --token-field accessToken
+ * node auth-test.js
+ * node auth-test.js --url http://localhost:5000 --signup /api/register --signin /api/login
+ * node auth-test.js --delete /api/user/delete-self
  */
 
 // ─── Node version guard ───────────────────────────────────────────────────────
 const [major] = process.versions.node.split('.').map(Number);
 if (major < 18) {
-  console.error('\n  ✘  Node.js 18+ required (uses built-in fetch).\n');
+  console.error('\n   ✘   Node.js 18+ required (uses built-in fetch).\n');
   process.exit(1);
 }
 
@@ -37,9 +38,10 @@ if (process.argv.includes('--help')) {
     node auth-test.js [options]
 
   Options:
-    --url           Base URL of your API         (default: http://localhost:3000)
+    --url           Base URL of your API          (default: http://localhost:3000)
     --signup        Signup endpoint path          (default: /auth/signup)
     --signin        Signin endpoint path          (default: /auth/signin)
+    --delete        Delete user endpoint path     (default: omitted, skips cleanup)
     --email-field   Email key in request body     (default: email)
     --pass-field    Password key in request body  (default: password)
     --token-field   Token key in signin response  (default: token)
@@ -48,7 +50,7 @@ if (process.argv.includes('--help')) {
   Examples:
     node auth-test.js
     node auth-test.js --url http://localhost:5000 --signup /api/register --signin /api/login
-    node auth-test.js --email-field username --pass-field pwd --token-field accessToken
+    node auth-test.js --delete /api/user/delete-self
 `);
   process.exit(0);
 }
@@ -65,6 +67,7 @@ const CONFIG = {
   baseUrl:     getArg('--url',          'http://localhost:3000'),
   signupPath:  getArg('--signup',       '/auth/signup'),
   signinPath:  getArg('--signin',       '/auth/signin'),
+  deletePath:  getArg('--delete',       null), // Optional cleanup path
   emailField:  getArg('--email-field',  'email'),
   passField:   getArg('--pass-field',   'password'),
   tokenField:  getArg('--token-field',  'token'),
@@ -94,15 +97,42 @@ const log = {
   divider: ()          => console.log(`${c.grey}──────────────────────────────────────${c.reset}`),
 };
 
-// ─── HTTP helper ──────────────────────────────────────────────────────────────
+// ─── URL Sanitizer Utility ────────────────────────────────────────────────────
+function buildUrl(base, path) {
+  const cleanBase = base.replace(/\/$/, '');
+  const cleanPath = path.replace(/^\//, '');
+  return `${cleanBase}/${cleanPath}`;
+}
+
+// ─── HTTP helpers ─────────────────────────────────────────────────────────────
 async function post(path, body) {
-  const url = `${CONFIG.baseUrl}${path}`;
+  const url = buildUrl(CONFIG.baseUrl, path);
   const start = Date.now();
   try {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+    });
+    const duration = Date.now() - start;
+    let data = null;
+    try { data = await res.json(); } catch { /* non-JSON body */ }
+    return { ok: res.ok, status: res.status, data, duration, error: null };
+  } catch (err) {
+    return { ok: false, status: null, data: null, duration: null, error: err.message };
+  }
+}
+
+async function del(path, token) {
+  const url = buildUrl(CONFIG.baseUrl, path);
+  const start = Date.now();
+  try {
+    const res = await fetch(url, {
+      method: 'DELETE',
+      headers: { 
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
     });
     const duration = Date.now() - start;
     let data = null;
@@ -134,7 +164,6 @@ function assert(condition, message) {
 }
 
 // ─── Token detection ─────────────────────────────────────────────────────────
-// Looks for a token in the signin response under common key names
 function extractToken(data) {
   if (!data || typeof data !== 'object') return null;
   const keys = [CONFIG.tokenField, 'accessToken', 'access_token', 'jwt', 'id_token', 'authToken'];
@@ -146,12 +175,15 @@ function extractToken(data) {
 
 // ─── Test suite ───────────────────────────────────────────────────────────────
 async function run() {
+  let acquiredToken = null;
+
   console.log(`\n${c.bold}  Auth Test Script${c.reset}`);
   log.divider();
-  console.log(`  ${c.grey}Base URL   :${c.reset} ${CONFIG.baseUrl}`);
-  console.log(`  ${c.grey}Signup path:${c.reset} ${CONFIG.signupPath}`);
-  console.log(`  ${c.grey}Signin path:${c.reset} ${CONFIG.signinPath}`);
-  console.log(`  ${c.grey}Test user  :${c.reset} ${TEST_EMAIL}`);
+  console.log(`  ${c.grey}Base URL    :${c.reset} ${CONFIG.baseUrl}`);
+  console.log(`  ${c.grey}Signup path :${c.reset} ${CONFIG.signupPath}`);
+  console.log(`  ${c.grey}Signin path :${c.reset} ${CONFIG.signinPath}`);
+  if (CONFIG.deletePath) console.log(`  ${c.grey}Delete path :${c.reset} ${CONFIG.deletePath}`);
+  console.log(`  ${c.grey}Test user   :${c.reset} ${TEST_EMAIL}`);
   log.divider();
 
   // ── SIGNUP TESTS ────────────────────────────────────────────────────────────
@@ -230,7 +262,10 @@ async function run() {
       res.ok,
       `Expected 200, got ${res.status}. Response: ${JSON.stringify(res.data)}`
     );
+    
     const token = extractToken(res.data);
+    if (token) acquiredToken = token.value;
+
     const tokenNote = token
       ? `token found at "${token.key}"`
       : `⚠ no token field found — check --token-field (currently "${CONFIG.tokenField}")`;
@@ -284,6 +319,22 @@ async function run() {
     );
     return `${res.status} · empty body correctly rejected`;
   });
+
+  // ── CLEANUP PROCESS ──────────────────────────────────────────────────────────
+  if (CONFIG.deletePath) {
+    log.section('Cleanup');
+    if (!acquiredToken) {
+      log.fail('Skipping data cleanup — No authorization token was acquired.');
+      results.push({ name: 'Cleanup user architecture', passed: false, reason: 'Missing auth token' });
+    } else {
+      await test('Test user deletion succeeds', async () => {
+        const res = await del(CONFIG.deletePath, acquiredToken);
+        assert(res.error === null, `Network error during cleanup — ${res.error}`);
+        assert(res.ok || [200, 204].includes(res.status), `Expected 200 or 204 for user deletion, got ${res.status}`);
+        return `${res.status} · Test artifact scrubbed from database.`;
+      });
+    }
+  }
 
   // ── SUMMARY ─────────────────────────────────────────────────────────────────
   const passed    = results.filter((r) => r.passed).length;
